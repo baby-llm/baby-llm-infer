@@ -772,7 +772,7 @@ def main():
     parser.add_argument('--no_kv_cache', action='store_true', help='Disable KV cache')
     parser.add_argument('--half', action='store_true', help='Use half precision (float16)')
     parser.add_argument('--quantize', type=str, choices=['4bit', '8bit'], help='Use quantization (requires bitsandbytes)')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps', 
                         help='Device to use (cuda/cpu/mps)')
     parser.add_argument('--no_opt_attention', action='store_true', 
                       help='Don\'t try to use optimized attention implementations')
