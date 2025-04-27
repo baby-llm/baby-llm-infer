@@ -7,15 +7,25 @@ from queue import Queue
 from threading import Thread
 from threading import Lock
 import os
+import logging
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Try to import optimizations
 try:
     import bitsandbytes as bnb
     has_bitsandbytes = True
+    logger.info("BitsAndBytes quantization available")
 except ImportError:
     has_bitsandbytes = False
+    logger.info("BitsAndBytes not available, quantization options will be limited")
 
 try:
     from transformers import BitsAndBytesConfig
@@ -23,13 +33,21 @@ try:
 except ImportError:
     has_bnb_config = False
 
+try:
+    import flash_attn
+    has_flash_attn = True
+    logger.info("Flash Attention 2 available")
+except ImportError:
+    has_flash_attn = False
+    logger.info("Flash Attention not available")
+
 ###################
 # MODEL LOADING UTILITIES
 ###################
 
-def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_code=False):
+def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_code=False, use_optimized_attention=True):
     """Load model with appropriate optimizations based on size and capabilities"""
-    print(f"Loading model {model_name}...")
+    logger.info(f"Loading model {model_name}...")
     
     # Determine dtype
     if device == "cpu" or quantize:
@@ -41,7 +59,7 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
     quantization_config = None
     if quantize and has_bnb_config:
         if quantize == "4bit":
-            print("Using 4-bit quantization")
+            logger.info("Using 4-bit quantization")
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
@@ -49,8 +67,20 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
                 bnb_4bit_quant_type="nf4"
             )
         elif quantize == "8bit" and has_bitsandbytes:
-            print("Using 8-bit quantization")
+            logger.info("Using 8-bit quantization")
             quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    
+    # Try to enable optimized attention if requested
+    attn_implementation = None
+    if use_optimized_attention:
+        if has_flash_attn:
+            attn_implementation = "flash_attention_2"
+            logger.info("Using Flash Attention 2 for improved performance")
+        elif hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            attn_implementation = "sdpa"
+            logger.info("Using PyTorch's Scaled Dot Product Attention")
+        else:
+            logger.info("Using default attention implementation")
     
     # Load tokenizer first with appropriate settings
     tokenizer = AutoTokenizer.from_pretrained(
@@ -72,13 +102,17 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
         "trust_remote_code": trust_remote_code,
     }
     
+    # Add attention implementation if available and requested
+    if attn_implementation and use_optimized_attention:
+        model_kwargs["attn_implementation"] = attn_implementation
+    
     if quantization_config:
         model_kwargs["quantization_config"] = quantization_config
     
     # For large models, use device_map="auto" for automatic offloading
     if not quantize and "llama" in model_name.lower() or "qwen" in model_name.lower() or "mistral" in model_name.lower():
         model_kwargs["device_map"] = "auto"
-        print("Using automatic device mapping for large model")
+        logger.info("Using automatic device mapping for large model")
     else:
         # For smaller models or when using quantization, we can specify the device directly
         model_kwargs["device_map"] = None
@@ -94,7 +128,11 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
         model.to(device)
     
     model.eval()
-    print(f"Loaded model with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
+    logger.info(f"Loaded model with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
+    
+    # Suggest torch.compile for advanced users
+    if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
+        logger.info("Note: For PyTorch >= 2.0, you can further optimize with: model = torch.compile(model, mode='reduce-overhead')")
     
     return model, tokenizer
 
@@ -122,17 +160,34 @@ class KeyValueCache:
 
 class Request:
     """Represents a generation request with its state"""
-    def __init__(self, input_ids, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0):
+    def __init__(self, input_ids, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0, repetition_penalty=1.0):
         self.input_ids = input_ids
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.repetition_penalty = repetition_penalty  # New parameter
         self.generated_ids = []
         self.done = False
         self.start_time = time.time()
         self.attention_mask = torch.ones_like(input_ids)
+        self.current_length = input_ids.shape[1]  # Track sequence length
         
+    def get_full_sequence(self):
+        """Return the full sequence (input + generated tokens)"""
+        return self.input_ids[0].tolist() + self.generated_ids
+        
+    def is_finished(self, eos_token_id=None):
+        """Check if generation should be finished"""
+        # Check if we've reached max tokens
+        if len(self.generated_ids) >= self.max_tokens:
+            return True
+            
+        # Check if most recent token is EOS
+        if eos_token_id is not None and self.generated_ids and self.generated_ids[-1] == eos_token_id:
+            return True
+            
+        return False
 
 class ContinuousBatcher:
     """Manages batched inference across multiple requests (core optimization)"""
@@ -200,80 +255,80 @@ class ContinuousBatcher:
             # Process the batch
             self._process_batch(requests_to_process)
             
+    def _prepare_model_inputs(self, requests_to_process):
+        """Prepare unified inputs for model forward pass"""
+        # Group requests by cache status (fresh vs continuation)
+        fresh_requests = []
+        continuation_requests = []
+        
+        for request_id, request in requests_to_process:
+            # Check if this request has a KV cache already
+            has_cache = False
+            with self.lock:
+                if request_id in self.request_caches:
+                    kv_cache = self.request_caches[request_id].get()
+                    has_cache = kv_cache is not None
+            
+            if has_cache:
+                continuation_requests.append((request_id, request))
+            else:
+                fresh_requests.append((request_id, request))
+        
+        return {
+            "fresh_requests": fresh_requests,
+            "continuation_requests": continuation_requests
+        }
+            
     def _process_batch(self, requests):
         """Process a batch of requests together (key to efficient inference)"""
-        batch_input_ids = []
-        batch_attention_masks = []
-        batch_request_ids = []
-        batch_past_key_values = []
+        # Prepare and categorize batch inputs
+        request_groups = self._prepare_model_inputs(requests)
         
-        # Prepare batch inputs
-        for request_id, request in requests:
-            if not request.generated_ids:
-                # First step - use the full prompt
+        # Process fresh requests (no KV cache) in a batch
+        if request_groups["fresh_requests"]:
+            batch_input_ids = []
+            batch_attention_masks = []
+            
+            for request_id, request in request_groups["fresh_requests"]:
                 batch_input_ids.append(request.input_ids)
                 batch_attention_masks.append(request.attention_mask)
-                batch_past_key_values.append(None)
-            else:
-                # Subsequent steps - use the last generated token and KV cache
-                batch_input_ids.append(torch.tensor([[request.generated_ids[-1]]], 
-                                                   device=request.input_ids.device))
-                # Extend attention mask for the new token
-                new_attention_mask = torch.cat([
-                    request.attention_mask,
-                    torch.ones((1, 1), device=request.attention_mask.device)
-                ], dim=1)
-                request.attention_mask = new_attention_mask
-                batch_attention_masks.append(new_attention_mask)
-                
-                # Get this request's KV cache
-                with self.lock:
-                    kv_cache = self.request_caches.get(request_id)
-                    if kv_cache:
-                        batch_past_key_values.append(kv_cache.get())
-                    else:
-                        batch_past_key_values.append(None)
-                
-            batch_request_ids.append(request_id)
             
-        # Group requests by whether they use KV cache or not
-        # In production, we'd handle this more elegantly with specialized schedulers
-        
-        # Process fresh requests (no KV cache)
-        fresh_indices = [i for i, pkv in enumerate(batch_past_key_values) if pkv is None]
-        if fresh_indices:
-            fresh_input_ids = torch.cat([batch_input_ids[i] for i in fresh_indices], dim=0)
-            fresh_attention_masks = torch.cat([batch_attention_masks[i] for i in fresh_indices], dim=0)
+            # Combine for batch processing
+            batched_input_ids = torch.cat(batch_input_ids, dim=0)
+            batched_attention_masks = torch.cat(batch_attention_masks, dim=0)
             
             # Forward pass for fresh requests
             with torch.no_grad():
                 outputs = self.model(
-                    input_ids=fresh_input_ids,
-                    attention_mask=fresh_attention_masks,
+                    input_ids=batched_input_ids,
+                    attention_mask=batched_attention_masks,
                     use_cache=True
                 )
-                
-            # Process results and update KV caches
-            for batch_idx, global_idx in enumerate(fresh_indices):
-                request_id = batch_request_ids[global_idx]
-                
+            
+            # Process results for each request
+            for batch_idx, (request_id, request) in enumerate(request_groups["fresh_requests"]):
                 with self.lock:
                     if request_id not in self.active_requests:
                         continue
                     
-                    request = self.active_requests[request_id]
+                    # Get logits for this request
                     next_token_logits = outputs.logits[batch_idx, -1, :]
                     
-                    # Apply temperature, top-p, and top-k sampling
+                    # Get full token sequence for repetition penalty
+                    full_sequence = request.get_full_sequence()
+                    
+                    # Sample next token with repetition penalty
                     next_token = self._sample_token(
                         next_token_logits, 
                         request.temperature, 
                         request.top_p,
-                        request.top_k
+                        request.top_k,
+                        request.repetition_penalty,
+                        full_sequence
                     )
                     request.generated_ids.append(next_token)
                     
-                    # Store KV cache for this request
+                    # Store KV cache
                     if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
                         # Extract this request's past_key_values
                         request_past_kv = tuple(
@@ -282,32 +337,31 @@ class ContinuousBatcher:
                         )
                         self.request_caches[request_id].update(request_past_kv)
                     
-                    # Check if generation is complete
-                    if len(request.generated_ids) >= request.max_tokens:
+                    # Check if generation is complete (including EOS check)
+                    if request.is_finished(self.tokenizer.eos_token_id):
                         request.done = True
         
         # Process continuation requests (with KV cache)
-        cont_indices = [i for i, pkv in enumerate(batch_past_key_values) if pkv is not None]
-        for idx in cont_indices:
-            request_id = batch_request_ids[idx]
-            
-            # Process each continuation request individually
-            # In a production system, we'd batch these by model parallel shards
+        for request_id, request in request_groups["continuation_requests"]:
             with self.lock:
                 if request_id not in self.active_requests:
                     continue
                 
-                request = self.active_requests[request_id]
+                # Process with KV cache
                 kv_cache = self.request_caches[request_id].get()
+                last_token = torch.tensor([[request.generated_ids[-1]]], device=request.input_ids.device)
                 
                 # Forward pass with KV cache
                 with torch.no_grad():
                     outputs = self.model(
-                        input_ids=batch_input_ids[idx],
-                        attention_mask=batch_attention_masks[idx],
+                        input_ids=last_token,
+                        attention_mask=request.attention_mask,
                         past_key_values=kv_cache,
                         use_cache=True
                     )
+                
+                # Get full sequence for repetition penalty
+                full_sequence = request.get_full_sequence()
                 
                 # Process results
                 next_token_logits = outputs.logits[0, -1, :]
@@ -315,20 +369,37 @@ class ContinuousBatcher:
                     next_token_logits, 
                     request.temperature, 
                     request.top_p,
-                    request.top_k
+                    request.top_k,
+                    request.repetition_penalty,
+                    full_sequence
                 )
                 request.generated_ids.append(next_token)
+                
+                # Update attention mask for the new token
+                request.attention_mask = torch.cat([
+                    request.attention_mask, 
+                    torch.ones((1, 1), device=request.attention_mask.device)
+                ], dim=1)
                 
                 # Update KV cache
                 if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
                     self.request_caches[request_id].update(outputs.past_key_values)
                 
-                # Check if generation is complete
-                if len(request.generated_ids) >= request.max_tokens:
+                # Check if generation is complete (including EOS check)
+                if request.is_finished(self.tokenizer.eos_token_id):
                     request.done = True
     
-    def _sample_token(self, logits, temperature, top_p, top_k=0):
-        """Sample next token using temperature, top-p, and top-k sampling"""
+    def _sample_token(self, logits, temperature, top_p, top_k=0, repetition_penalty=1.0, prev_tokens=None):
+        """Sample next token using temperature, top-p, top-k, and repetition penalties"""
+        # Apply repetition penalty if provided
+        if repetition_penalty != 1.0 and prev_tokens is not None and len(prev_tokens) > 0:
+            # Convert to tensor for efficient indexing if it's a list
+            if isinstance(prev_tokens, list):
+                prev_tokens = torch.tensor(prev_tokens, device=logits.device)
+            # Apply penalty - reduce probability of tokens that have already appeared
+            for token_id in set(prev_tokens.tolist()):
+                logits[token_id] /= repetition_penalty
+        
         if temperature > 0:
             logits = logits / temperature
             
@@ -372,7 +443,8 @@ class ContinuousBatcher:
 # GENERATION FUNCTIONS
 ###################
 
-def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0, use_kv_cache=True):
+def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0, 
+                 use_kv_cache=True, repetition_penalty=1.0):
     """Generate text from a prompt using the model with KV cache optimization"""
     model.eval()
     
@@ -403,6 +475,13 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
         
         # Get next token logits
         next_token_logits = outputs.logits[0, -1, :]
+        
+        # Apply repetition penalty to input tokens
+        if repetition_penalty > 1.0:
+            input_token_ids = input_ids[0].tolist()
+            # Penalize tokens that appeared in the prompt
+            for token_id in set(input_token_ids):
+                next_token_logits[token_id] /= repetition_penalty
         
         # Apply sampling (temperature, top-p, top-k)
         if temperature > 0:
@@ -435,12 +514,20 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
         next_token = torch.multinomial(probs, 1).item()
         generated_ids.append(next_token)
         
+        # Check for EOS token
+        if next_token == tokenizer.eos_token_id:
+            pass  # We'll still include this EOS token but won't generate further
+        
         # Update KV cache if using it
         if use_kv_cache:
             past_key_values = outputs.past_key_values
             
         # Generate remaining tokens auto-regressively
         for _ in range(max_tokens - 1):
+            # Check if we've already hit EOS
+            if generated_ids[-1] == tokenizer.eos_token_id:
+                break
+                
             # Prepare inputs for the next iteration
             new_input_ids = torch.tensor([[next_token]], device=device)
             
@@ -461,6 +548,12 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
             
             # Get logits and sample next token
             next_token_logits = outputs.logits[0, -1, :]
+            
+            # Apply repetition penalty on the full sequence
+            if repetition_penalty > 1.0:
+                full_sequence = input_ids[0].tolist() + generated_ids
+                for token_id in set(full_sequence):
+                    next_token_logits[token_id] /= repetition_penalty
             
             # Apply sampling (temperature, top-p, top-k)
             if temperature > 0:
@@ -493,6 +586,10 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
             next_token = torch.multinomial(probs, 1).item()
             generated_ids.append(next_token)
             
+            # Check for EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+            
             # Update KV cache
             if use_kv_cache:
                 past_key_values = outputs.past_key_values
@@ -510,7 +607,7 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
     return generated_text, total_time, tokens_per_second
 
 
-def generate_text_batch(model, tokenizer, prompts, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0):
+def generate_text_batch(model, tokenizer, prompts, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0, repetition_penalty=1.0):
     """Generate text for multiple prompts using continuous batching"""
     # Determine what device the model is on
     if hasattr(model, 'device'):
@@ -529,7 +626,14 @@ def generate_text_batch(model, tokenizer, prompts, max_tokens=50, temperature=1.
         encoded = tokenizer(prompt, return_tensors="pt")
         input_ids = encoded.input_ids.to(device)
         
-        request = Request(input_ids, max_tokens, temperature, top_p, top_k)
+        request = Request(
+            input_ids, 
+            max_tokens=max_tokens, 
+            temperature=temperature, 
+            top_p=top_p, 
+            top_k=top_k,
+            repetition_penalty=repetition_penalty
+        )
         batcher.add_request(i, request)
     
     # Wait for all requests to complete
@@ -572,14 +676,15 @@ def generate_text_batch(model, tokenizer, prompts, max_tokens=50, temperature=1.
 
 def demo(args):
     """Run a demonstration of the model's generation capabilities"""
-    print(f"Initializing on {args.device}...")
+    logger.info(f"Initializing on {args.device}...")
     
     # Load model and tokenizer with appropriate settings
     model, tokenizer = load_model_and_tokenizer(
         args.model_name, 
         args.device, 
         args.quantize,
-        args.trust_remote_code
+        args.trust_remote_code,
+        not args.no_opt_attention
     )
     
     # Use provided prompt or defaults
@@ -593,7 +698,8 @@ def demo(args):
         ]
     
     print(f"\n{'-'*50}")
-    print(f"Generation parameters: max_tokens={args.max_tokens}, temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}")
+    print(f"Generation parameters: max_tokens={args.max_tokens}, temperature={args.temperature}, "
+          f"top_p={args.top_p}, top_k={args.top_k}, repetition_penalty={args.repetition_penalty}")
     print(f"Using {'batched' if args.batch else 'single'} inference with KV cache {'disabled' if args.no_kv_cache else 'enabled'}")
     print(f"{'-'*50}\n")
     
@@ -607,7 +713,8 @@ def demo(args):
             max_tokens=args.max_tokens, 
             temperature=args.temperature, 
             top_p=args.top_p,
-            top_k=args.top_k
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty
         )
         
         total_tokens = 0
@@ -632,7 +739,8 @@ def demo(args):
                 temperature=args.temperature, 
                 top_p=args.top_p,
                 top_k=args.top_k,
-                use_kv_cache=not args.no_kv_cache
+                use_kv_cache=not args.no_kv_cache,
+                repetition_penalty=args.repetition_penalty
             )
             
             print(f"Completion: {output}")
@@ -656,6 +764,8 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
     parser.add_argument('--top_p', type=float, default=0.9, help='Top-p (nucleus) sampling parameter')
     parser.add_argument('--top_k', type=int, default=0, help='Top-k sampling parameter (0 to disable)')
+    parser.add_argument('--repetition_penalty', type=float, default=1.0, 
+                      help='Penalty for repetition (1.0 = no penalty, >1.0 = reduce repetition)')
     
     # Inference optimizations
     parser.add_argument('--batch', action='store_true', help='Use continuous batching')
@@ -664,6 +774,8 @@ def main():
     parser.add_argument('--quantize', type=str, choices=['4bit', '8bit'], help='Use quantization (requires bitsandbytes)')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
                         help='Device to use (cuda/cpu/mps)')
+    parser.add_argument('--no_opt_attention', action='store_true', 
+                      help='Don\'t try to use optimized attention implementations')
     
     args = parser.parse_args()
     
@@ -674,7 +786,7 @@ def main():
         args.device = 'cuda'
     else:
         args.device = 'cpu'
-        print("Falling back to CPU")
+        logger.info("Falling back to CPU")
     
     # Run the demo
     demo(args)
