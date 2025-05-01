@@ -100,35 +100,17 @@ Use Logging: Replace print statements for internal status updates (like "Using X
 
 # v1.1.1
 ## Result
-"""
-python baby_infer_engine.py --model_name Qwen/Qwen2.5-1.5B-Instruct --prompt "The capit
-al of China is" --max_tokens 50 --trust_remote_code
-2025-04-27 15:19:47,223 - INFO - BitsAndBytes not available, quantization options will be limited
-2025-04-27 15:19:47,230 - INFO - Flash Attention not available
-2025-04-27 15:19:47,233 - INFO - Falling back to CPU
-2025-04-27 15:19:47,233 - INFO - Initializing on cpu...
-2025-04-27 15:19:47,233 - INFO - Loading model Qwen/Qwen2.5-1.5B-Instruct...
-2025-04-27 15:19:47,233 - INFO - Using PyTorch's Scaled Dot Product Attention
-tokenizer_config.json: 100%|████████████████████████████████████████████████████████████████████████████████████████| 7.30k/7.30k [00:00<00:00, 38.1MB/s]
-vocab.json: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████| 2.78M/2.78M [00:00<00:00, 4.06MB/s]
-merges.txt: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████| 1.67M/1.67M [00:00<00:00, 2.51MB/s]
-tokenizer.json: 100%|███████████████████████████████████████████████████████████████████████████████████████████████| 7.03M/7.03M [00:00<00:00, 7.60MB/s]
-2025-04-27 15:19:52,857 - INFO - Using automatic device mapping for large model
-config.json: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████| 660/660 [00:00<00:00, 6.23MB/s]
-model.safetensors: 100%|█████████████████████████████████████████████████████████████████████████████████████████████| 3.09G/3.09G [00:22<00:00, 138MB/s]
-Sliding Window Attention is enabled but not implemented for `sdpa`; unexpected results may be encountered.
-generation_config.json: 100%|███████████████████████████████████████████████████████████████████████████████████████████| 242/242 [00:00<00:00, 2.69MB/s]
-2025-04-27 15:20:39,208 - INFO - Loaded model with 1,543,714,304 trainable parameters
-2025-04-27 15:20:39,208 - INFO - Note: For PyTorch >= 2.0, you can further optimize with: model = torch.compile(model, mode='reduce-overhead')
-
---------------------------------------------------
-Generation parameters: max_tokens=50, temperature=0.7, top_p=0.9, top_k=0, repetition_penalty=1.0
-Using single inference with KV cache enabled
---------------------------------------------------
-
-
 Prompt 1: The capital of China is
-Completion: The capital of China is Beijing. （对划线部分提问） Where is the capital of China？ 考查特殊疑问句。划线部分是Beijing，是地点，提问用Where，原句是一般现在时，疑问句也是一般
-Generated in 14.41 seconds
-Tokens per second: 3.82
-"""
+Completion: The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels. 
+
+The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels. 
+
+The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels. 
+
+The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels. 
+
+The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels. 
+
+The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels. 
+
+The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
