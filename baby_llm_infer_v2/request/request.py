@@ -1,5 +1,5 @@
-import torch
 import time
+import torch
 from typing import List, Optional, Dict, Any
 
 from .interfaces import GenerationRequest
@@ -10,8 +10,10 @@ class Request(GenerationRequest):
     def __init__(
         self,
         input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         max_tokens: int = 50,
-        sampling_config: Optional[SamplingConfig] = None
+        sampling_config: Optional[SamplingConfig] = None,
+        prompt: str = ""  # Store the original prompt for Qwen models
     ):
         self.input_ids = input_ids
         self.max_tokens = max_tokens
@@ -19,8 +21,9 @@ class Request(GenerationRequest):
         self.generated_ids: List[int] = []
         self.done = False
         self.start_time = time.time()
-        self.attention_mask = torch.ones_like(input_ids)
+        self.attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
         self.current_length = input_ids.shape[1]
+        self.prompt = prompt  # Store the original prompt
         
     def get_full_sequence(self) -> List[int]:
         """Return the full sequence (input + generated tokens)"""
@@ -41,13 +44,3 @@ class Request(GenerationRequest):
             return True
             
         return False
-        
-    @property
-    def metrics(self) -> Dict[str, Any]:
-        """Get metrics about this request"""
-        elapsed = time.time() - self.start_time
-        return {
-            "elapsed_time": elapsed,
-            "tokens_generated": len(self.generated_ids),
-            "tokens_per_second": len(self.generated_ids) / max(0.001, elapsed)
-        }

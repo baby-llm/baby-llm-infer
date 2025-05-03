@@ -3,6 +3,9 @@ import time
 import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 
+# For Qwen-specific cache handling
+from transformers.cache_utils import Cache as HFCache
+
 from ..config.generation_config import GenerationConfig, SamplingConfig
 from ..request.request import Request
 from ..request.batcher import ContinuousBatcher
@@ -59,6 +62,7 @@ class GenerationEngine:
             )
         else:
             # Use standard generation without KV cache
+            # TODO 解释这里的generate内部发生了什么
             with torch.no_grad():
                 outputs = self.model.generate(
                     input_ids=input_ids,
@@ -102,15 +106,7 @@ class GenerationEngine:
         prompts: List[str],
         config: Optional[GenerationConfig] = None
     ) -> List[Dict[str, Any]]:
-        """Generate text for multiple prompts using continuous batching
-        
-        Args:
-            prompts: List of input text prompts
-            config: Generation configuration
-            
-        Returns:
-            List of dictionaries with generated text and metrics
-        """
+        """Generate text for multiple prompts using continuous batching"""
         # Use default config if none provided
         if config is None:
             config = GenerationConfig()
@@ -125,16 +121,20 @@ class GenerationEngine:
         start_time = time.time()
         
         for i, prompt in enumerate(prompts):
+            # Only encode one prompt at a time - batching will be handled by the batcher
             encoded = self.tokenizer(prompt, return_tensors="pt")
             input_ids = encoded.input_ids.to(device)
+            attention_mask = encoded.attention_mask.to(device)
             
             request = Request(
-                input_ids, 
+                input_ids,
+                attention_mask=attention_mask,
                 max_tokens=config.max_tokens,
-                sampling_config=config.sampling
+                sampling_config=config.sampling,
+                prompt=prompt  # Pass the original prompt
             )
             batcher.add_request(i, request)
-        
+
         # Wait for all requests to complete
         results = {}
         all_done = False
@@ -207,6 +207,7 @@ class GenerationEngine:
         
         with torch.no_grad():
             # Process the full prompt first
+            # 解释这里传入use_cache = True/False的区别是什么 在哪里可以看到这个函数的签名和含义
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -241,9 +242,11 @@ class GenerationEngine:
                     break
                     
                 # Prepare inputs for the next iteration
+                # TODO 这里只需要传入一个next_token就可以吗
                 new_input_ids = torch.tensor([[next_token]], device=input_ids.device)
                 
                 # Extend attention mask for the new token
+                # TODO 解释这里的 cat 的作用
                 attention_mask = torch.cat([
                     attention_mask, 
                     torch.ones((1, 1), device=input_ids.device, dtype=attention_mask.dtype)
