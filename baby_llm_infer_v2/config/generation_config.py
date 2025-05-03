@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 @dataclass
@@ -18,7 +18,7 @@ class SamplingConfig:
 class GenerationConfig:
     """Configuration for text generation"""
     max_tokens: int = 50
-    sampling: SamplingConfig = SamplingConfig()
+    sampling: SamplingConfig = field(default_factory=SamplingConfig) 
     use_kv_cache: bool = True
     stop_sequences: List[str] = None
     

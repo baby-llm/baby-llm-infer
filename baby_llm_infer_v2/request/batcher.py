@@ -2,9 +2,12 @@ import time
 import torch
 from queue import Queue
 from threading import Thread, Lock
+from typing import Dict, Tuple, List, Optional, Any
 
-from ..generation.sampling import sample_token
+from .interfaces import Cache, GenerationRequest
 from .cache import KeyValueCache
+from .request import Request
+from ..generation.sampling.strategies import TopPTopKSampler, GreedyTokenSampler
 
 class ContinuousBatcher:
     """Manages batched inference across multiple requests (core optimization)"""
@@ -20,19 +23,25 @@ class ContinuousBatcher:
         # Maintain a KV cache for each active request
         self.request_caches = {}
         
+        # Create samplers for token selection
+        self.samplers = {
+            'greedy': GreedyTokenSampler(),
+            'sampling': TopPTopKSampler()
+        }
+        
         # Start processing thread
         self.thread = Thread(target=self._process_batches)
         self.thread.daemon = True
         self.thread.start()
         
-    def add_request(self, request_id, request):
+    def add_request(self, request_id, request: Request):
         """Add a new request to be processed"""
         with self.lock:
             # Create a new KV cache for this request
             self.request_caches[request_id] = KeyValueCache()
         self.request_queue.put((request_id, request))
         
-    def get_result(self, request_id):
+    def get_result(self, request_id) -> Optional[List[int]]:
         """Get results for a specific request if completed"""
         with self.lock:
             if request_id in self.active_requests and self.active_requests[request_id].done:
@@ -103,63 +112,74 @@ class ContinuousBatcher:
         
         # Process fresh requests (no KV cache) in a batch
         if request_groups["fresh_requests"]:
-            batch_input_ids = []
-            batch_attention_masks = []
-            
-            for request_id, request in request_groups["fresh_requests"]:
-                batch_input_ids.append(request.input_ids)
-                batch_attention_masks.append(request.attention_mask)
-            
-            # Combine for batch processing
-            batched_input_ids = torch.cat(batch_input_ids, dim=0)
-            batched_attention_masks = torch.cat(batch_attention_masks, dim=0)
-            
-            # Forward pass for fresh requests
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=batched_input_ids,
-                    attention_mask=batched_attention_masks,
-                    use_cache=True
-                )
-            
-            # Process results for each request
-            for batch_idx, (request_id, request) in enumerate(request_groups["fresh_requests"]):
-                with self.lock:
-                    if request_id not in self.active_requests:
-                        continue
-                    
-                    # Get logits for this request
-                    next_token_logits = outputs.logits[batch_idx, -1, :]
-                    
-                    # Get full token sequence for repetition penalty
-                    full_sequence = request.get_full_sequence()
-                    
-                    # Sample next token with repetition penalty
-                    next_token = sample_token(
-                        next_token_logits, 
-                        request.temperature, 
-                        request.top_p,
-                        request.top_k,
-                        request.repetition_penalty,
-                        full_sequence
-                    )
-                    request.generated_ids.append(next_token)
-                    
-                    # Store KV cache
-                    if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
-                        # Extract this request's past_key_values
-                        request_past_kv = tuple(
-                            (layer_past[0][batch_idx:batch_idx+1], layer_past[1][batch_idx:batch_idx+1])
-                            for layer_past in outputs.past_key_values
-                        )
-                        self.request_caches[request_id].update(request_past_kv)
-                    
-                    # Check if generation is complete (including EOS check)
-                    if request.is_finished(self.tokenizer.eos_token_id):
-                        request.done = True
+            self._process_fresh_requests(request_groups["fresh_requests"])
         
         # Process continuation requests (with KV cache)
-        for request_id, request in request_groups["continuation_requests"]:
+        self._process_continuation_requests(request_groups["continuation_requests"])
+    
+    def _process_fresh_requests(self, fresh_requests):
+        """Process requests that don't have a KV cache yet"""
+        if not fresh_requests:
+            return
+            
+        batch_input_ids = []
+        batch_attention_masks = []
+        
+        for request_id, request in fresh_requests:
+            batch_input_ids.append(request.input_ids)
+            batch_attention_masks.append(request.attention_mask)
+        
+        # Combine for batch processing
+        batched_input_ids = torch.cat(batch_input_ids, dim=0)
+        batched_attention_masks = torch.cat(batch_attention_masks, dim=0)
+        
+        # Forward pass for fresh requests
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=batched_input_ids,
+                attention_mask=batched_attention_masks,
+                use_cache=True
+            )
+        
+        # Process results for each request
+        for batch_idx, (request_id, request) in enumerate(fresh_requests):
+            with self.lock:
+                if request_id not in self.active_requests:
+                    continue
+                
+                # Get logits for this request
+                next_token_logits = outputs.logits[batch_idx, -1, :]
+                
+                # Get full token sequence for repetition penalty
+                full_sequence = request.get_full_sequence()
+                
+                # Select sampler based on temperature
+                sampler = self._get_sampler_for_request(request)
+                
+                # Sample next token with repetition penalty
+                next_token = sampler.sample(
+                    next_token_logits, 
+                    request.sampling_config,
+                    full_sequence
+                )
+                request.add_token(next_token)
+                
+                # Store KV cache
+                if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
+                    # Extract this request's past_key_values
+                    request_past_kv = tuple(
+                        (layer_past[0][batch_idx:batch_idx+1], layer_past[1][batch_idx:batch_idx+1])
+                        for layer_past in outputs.past_key_values
+                    )
+                    self.request_caches[request_id].update(request_past_kv)
+                
+                # Check if generation is complete (including EOS check)
+                if request.is_finished(self.tokenizer.eos_token_id):
+                    request.done = True
+    
+    def _process_continuation_requests(self, continuation_requests):
+        """Process requests that already have a KV cache"""
+        for request_id, request in continuation_requests:
             with self.lock:
                 if request_id not in self.active_requests:
                     continue
@@ -180,17 +200,17 @@ class ContinuousBatcher:
                 # Get full sequence for repetition penalty
                 full_sequence = request.get_full_sequence()
                 
+                # Select sampler based on temperature
+                sampler = self._get_sampler_for_request(request)
+                
                 # Process results
                 next_token_logits = outputs.logits[0, -1, :]
-                next_token = sample_token(
+                next_token = sampler.sample(
                     next_token_logits, 
-                    request.temperature, 
-                    request.top_p,
-                    request.top_k,
-                    request.repetition_penalty,
+                    request.sampling_config,
                     full_sequence
                 )
-                request.generated_ids.append(next_token)
+                request.add_token(next_token)
                 
                 # Update attention mask for the new token
                 request.attention_mask = torch.cat([
@@ -205,6 +225,13 @@ class ContinuousBatcher:
                 # Check if generation is complete (including EOS check)
                 if request.is_finished(self.tokenizer.eos_token_id):
                     request.done = True
+    
+    def _get_sampler_for_request(self, request):
+        """Get the appropriate sampler based on request parameters"""
+        if request.sampling_config.temperature == 0:
+            return self.samplers['greedy']
+        else:
+            return self.samplers['sampling']
     
     def stop(self):
         """Stop the batcher thread"""

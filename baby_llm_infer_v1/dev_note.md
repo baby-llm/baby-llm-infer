@@ -68,17 +68,34 @@ In conclusion, you need to consider various possible design principles and desig
 
 ## Result
 
+root@autodl-container-df76488929-db613d16:~/baby-llm-infer# python -m baby_llm_infer_v2.main --model_name Qwen/Qwen3-1.7B --prompt "The capital of China is" --
+max_tokens 50 --trust_remote_code
+2025-05-03 17:46:21,298 - INFO - Initializing on cuda...
+2025-05-03 17:46:21,298 - INFO - Loading model Qwen/Qwen3-1.7B...
+2025-05-03 17:46:21,298 - INFO - Using device: cuda
+2025-05-03 17:46:21,298 - INFO - Using Flash Attention 2 for improved performance
+2025-05-03 17:46:21,298 - INFO - Using automatic device mapping for large model
+config.json: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████| 726/726 [00:00<00:00, 6.48MB/s]
+model.safetensors.index.json: 100%|████████████████████████████████████████████████████████████████████████████████████████| 25.6k/25.6k [00:00<00:00, 127MB/s]
+model-00002-of-00002.safetensors: 100%|█████████████████████████████████████████████████████████████████████████████████████| 622M/622M [02:23<00:00, 4.33MB/s]
+model-00001-of-00002.safetensors: 100%|███████████████████████████████████████████████████████████████████████████████████| 3.44G/3.44G [08:54<00:00, 6.44MB/s]
+Fetching 2 files: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [08:56<00:00, 268.14s/it]
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  2.19it/s]
+generation_config.json: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████| 239/239 [00:00<00:00, 2.86MB/s]
+2025-05-03 17:55:21,189 - INFO - Loaded model with 1,720,574,976 trainable parameters
+2025-05-03 17:55:21,190 - INFO - Note: For PyTorch >= 2.0, you can further optimize with: model = torch.compile(model, mode='reduce-overhead')
+tokenizer_config.json: 100%|██████████████████████████████████████████████████████████████████████████████████████████████| 9.68k/9.68k [00:00<00:00, 79.3MB/s]
+vocab.json: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████| 2.78M/2.78M [00:00<00:00, 148MB/s]
+merges.txt: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████| 1.67M/1.67M [00:00<00:00, 154MB/s]
+tokenizer.json: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 11.4M/11.4M [00:03<00:00, 3.75MB/s]
+
+--------------------------------------------------
+Generation parameters: {"max_tokens": 50, "sampling": {"temperature": 0.7, "top_p": 0.9, "top_k": 0, "repetition_penalty": 1.0}, "use_kv_cache": true, "stop_sequences": null}
+Using single inference with KV cache enabled
+--------------------------------------------------
+
+
 Prompt 1: The capital of China is
-Completion: The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
-
-The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
-
-The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
-
-The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
-
-The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
-
-The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
-
-The capital of China is Beijing, and the capital of France is Paris. What is the capital of Belgium? The capital of Belgium is Brussels.
+Completion: The capital of China is Beijing, and the population of the capital is 21.5 million. The population of the capital is 21.5 million. The population of the capital is 21.5 million. The population of the capital is 2
+Generated in 2.14 seconds
+Tokens per second: 23.32
