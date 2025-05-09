@@ -90,12 +90,14 @@ merges.txt: 100%|█████████████████████
 tokenizer.json: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 11.4M/11.4M [00:03<00:00, 3.75MB/s]
 
 --------------------------------------------------
+
 Generation parameters: {"max_tokens": 50, "sampling": {"temperature": 0.7, "top_p": 0.9, "top_k": 0, "repetition_penalty": 1.0}, "use_kv_cache": true, "stop_sequences": null}
 Using single inference with KV cache enabled
 --------------------------------------------------
-
 
 Prompt 1: The capital of China is
 Completion: The capital of China is Beijing, and the population of the capital is 21.5 million. The population of the capital is 21.5 million. The population of the capital is 21.5 million. The population of the capital is 2
 Generated in 2.14 seconds
 Tokens per second: 23.32
+
+## Task

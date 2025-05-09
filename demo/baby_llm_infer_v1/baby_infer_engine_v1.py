@@ -1,4 +1,3 @@
-# huggingface_optimized_inference.py
 import torch
 import torch.nn.functional as F
 import time
@@ -49,6 +48,15 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
     """Load model with appropriate optimizations based on size and capabilities"""
     logger.info(f"Loading model {model_name}...")
     
+    # Check if we're using a Qwen model
+    is_qwen_model = "qwen" in model_name.lower()
+    if is_qwen_model:
+        logger.info("Detected Qwen model, applying specific optimizations")
+        # Qwen models typically require trust_remote_code
+        if not trust_remote_code:
+            logger.warning("Qwen models require trust_remote_code=True. Setting it automatically.")
+            trust_remote_code = True
+    
     # Determine dtype
     if device == "cpu" or quantize:
         dtype = torch.float32  # Will be overridden by quantization if enabled
@@ -89,7 +97,7 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
         padding_side="left"  # Important for efficient batch processing
     )
     
-    # Ensure padding token exists
+    # Ensure padding token exists - critical for Qwen tokenizer
     if tokenizer.pad_token is None:
         if tokenizer.eos_token:
             tokenizer.pad_token = tokenizer.eos_token
@@ -110,7 +118,7 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
         model_kwargs["quantization_config"] = quantization_config
     
     # For large models, use device_map="auto" for automatic offloading
-    if not quantize and "llama" in model_name.lower() or "qwen" in model_name.lower() or "mistral" in model_name.lower():
+    if not quantize and (is_qwen_model or "llama" in model_name.lower() or "mistral" in model_name.lower()):
         model_kwargs["device_map"] = "auto"
         logger.info("Using automatic device mapping for large model")
     else:
@@ -132,27 +140,108 @@ def load_model_and_tokenizer(model_name, device, quantize=None, trust_remote_cod
     
     # Suggest torch.compile for advanced users
     if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
-        logger.info("Note: For PyTorch >= 2.0, you can further optimize with: model = torch.compile(model, mode='reduce-overhead')")
+        logger.info("Note: For PyTorch >= 2.0, you can further optimize with: model = torch.compile(model)")
     
     return model, tokenizer
 
 ###################
-# KV CACHE
+# PAGED KV CACHE
 ###################
 
-class KeyValueCache:
-    """Optimized key-value cache for transformer layers"""
-    def __init__(self):
-        self.past_key_values = None
+class PagedKeyValueCache:
+    """Memory-efficient key-value cache using paging for transformer layers"""
+    def __init__(self, page_size=16, max_pages=64):
+        self.page_size = page_size  # Number of tokens per page
+        self.max_pages = max_pages  # Maximum number of pages to store
+        self.pages = []  # List of KV cache pages
+        self.current_length = 0  # Current number of tokens in the cache
     
     def get(self):
-        return self.past_key_values
-    
-    def update(self, past_key_values):
-        self.past_key_values = past_key_values
+        """Return the consolidated cache for model processing"""
+        if not self.pages:
+            return None
         
+        # If only one page, return it directly
+        if len(self.pages) == 1:
+            return self.pages[0]
+        
+        # Concatenate pages along the sequence dimension for each layer
+        consolidated = []
+        for layer_idx in range(len(self.pages[0])):
+            layer_pages_k = [page[layer_idx][0] for page in self.pages]
+            layer_pages_v = [page[layer_idx][1] for page in self.pages]
+            
+            # Concatenate along sequence dimension (dim=2)
+            k_cache = torch.cat(layer_pages_k, dim=2)
+            v_cache = torch.cat(layer_pages_v, dim=2)
+            
+            consolidated.append((k_cache, v_cache))
+        
+        return tuple(consolidated)
+    
+    def update(self, new_kv_cache):
+        """Update the cache with new KV values"""
+        if new_kv_cache is None:
+            return
+        
+        # For first update, just store the cache as first page
+        if not self.pages:
+            self.pages.append(new_kv_cache)
+            # Get sequence length from first layer's key cache
+            self.current_length = new_kv_cache[0][0].size(2)  
+            return
+        
+        # Extract the new tokens' KV values (typically just the last token)
+        new_tokens = []
+        for layer_idx in range(len(new_kv_cache)):
+            k_new = new_kv_cache[layer_idx][0]
+            v_new = new_kv_cache[layer_idx][1]
+            
+            # Extract only the newly generated tokens (usually just the last one)
+            k_last = k_new[:, :, -1:, :]  # Just the last token
+            v_last = v_new[:, :, -1:, :]
+            
+            new_tokens.append((k_last, v_last))
+        
+        # Create a new page if current page is full or we're at page boundary
+        current_page_idx = self.current_length // self.page_size
+        current_page_pos = self.current_length % self.page_size
+        
+        if current_page_pos == 0:  # We're at a page boundary
+            # Create new page with the new token
+            self.pages.append(tuple(new_tokens))
+        else:
+            # Need to append to the last page
+            last_page = self.pages[-1]
+            updated_page = []
+            
+            for layer_idx in range(len(last_page)):
+                k_last = last_page[layer_idx][0]
+                v_last = last_page[layer_idx][1]
+                
+                k_new = new_tokens[layer_idx][0]
+                v_new = new_tokens[layer_idx][1]
+                
+                # Concatenate along sequence dimension
+                k_updated = torch.cat([k_last, k_new], dim=2)
+                v_updated = torch.cat([v_last, v_new], dim=2)
+                
+                updated_page.append((k_updated, v_updated))
+            
+            self.pages[-1] = tuple(updated_page)
+        
+        self.current_length += 1  # Increment token count
+        
+        # Remove oldest pages if exceeding max pages
+        while len(self.pages) > self.max_pages:
+            oldest_page_len = self.pages[0][0][0].size(2)
+            self.pages.pop(0)
+            self.current_length -= oldest_page_len
+    
     def reset(self):
-        self.past_key_values = None
+        """Reset the cache"""
+        self.pages = []
+        self.current_length = 0
 
 ###################
 # REQUEST HANDLING
@@ -166,7 +255,7 @@ class Request:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
-        self.repetition_penalty = repetition_penalty  # New parameter
+        self.repetition_penalty = repetition_penalty
         self.generated_ids = []
         self.done = False
         self.start_time = time.time()
@@ -190,8 +279,8 @@ class Request:
         return False
 
 class ContinuousBatcher:
-    """Manages batched inference across multiple requests (core optimization)"""
-    def __init__(self, model, tokenizer, max_batch_size=8):
+    """Manages batched inference across multiple requests with paged KV cache"""
+    def __init__(self, model, tokenizer, max_batch_size=8, page_size=16, max_pages=64):
         self.model = model
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
@@ -200,8 +289,19 @@ class ContinuousBatcher:
         self.lock = Lock()
         self.running = True
         
-        # Maintain a KV cache for each active request
+        # Use paged KV cache for memory efficiency
         self.request_caches = {}
+        
+        # Determine if we're using a Qwen model for specific optimizations
+        self.is_qwen_model = "qwen" in tokenizer.name_or_path.lower() if hasattr(tokenizer, 'name_or_path') else False
+        if self.is_qwen_model:
+            logger.info("Initializing batcher with Qwen-specific optimizations")
+            # Qwen typically benefits from larger page sizes
+            page_size = 32
+            max_pages = 128
+        
+        self.page_size = page_size
+        self.max_pages = max_pages
         
         # Start processing thread
         self.thread = Thread(target=self._process_batches)
@@ -211,8 +311,11 @@ class ContinuousBatcher:
     def add_request(self, request_id, request):
         """Add a new request to be processed"""
         with self.lock:
-            # Create a new KV cache for this request
-            self.request_caches[request_id] = KeyValueCache()
+            # Create a new paged KV cache for this request
+            self.request_caches[request_id] = PagedKeyValueCache(
+                page_size=self.page_size, 
+                max_pages=self.max_pages
+            )
         self.request_queue.put((request_id, request))
         
     def get_result(self, request_id):
@@ -280,7 +383,7 @@ class ContinuousBatcher:
         }
             
     def _process_batch(self, requests):
-        """Process a batch of requests together (key to efficient inference)"""
+        """Process a batch of requests together using paged KV cache"""
         # Prepare and categorize batch inputs
         request_groups = self._prepare_model_inputs(requests)
         
@@ -328,7 +431,7 @@ class ContinuousBatcher:
                     )
                     request.generated_ids.append(next_token)
                     
-                    # Store KV cache
+                    # Store KV cache using paged approach
                     if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
                         # Extract this request's past_key_values
                         request_past_kv = tuple(
@@ -347,7 +450,7 @@ class ContinuousBatcher:
                 if request_id not in self.active_requests:
                     continue
                 
-                # Process with KV cache
+                # Process with paged KV cache
                 kv_cache = self.request_caches[request_id].get()
                 last_token = torch.tensor([[request.generated_ids[-1]]], device=request.input_ids.device)
                 
@@ -381,7 +484,7 @@ class ContinuousBatcher:
                     torch.ones((1, 1), device=request.attention_mask.device)
                 ], dim=1)
                 
-                # Update KV cache
+                # Update KV cache using paged approach
                 if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
                     self.request_caches[request_id].update(outputs.past_key_values)
                 
@@ -455,6 +558,9 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
         # If model is spread across devices, use the first parameter's device
         device = next(model.parameters()).device
     
+    # Check if using Qwen model for specific processing
+    is_qwen_model = "qwen" in tokenizer.name_or_path.lower() if hasattr(tokenizer, 'name_or_path') else False
+    
     # Encode the prompt
     encoded = tokenizer(prompt, return_tensors="pt")
     input_ids = encoded.input_ids.to(device)
@@ -463,7 +569,12 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
     # Time the generation
     start_time = time.time()
     generated_ids = []
-    past_key_values = None
+    
+    # Use paged KV cache for better memory efficiency
+    kv_cache = PagedKeyValueCache(
+        page_size=32 if is_qwen_model else 16,  # Larger pages for Qwen
+        max_pages=128 if is_qwen_model else 64  # More pages for Qwen
+    ) if use_kv_cache else None
     
     with torch.no_grad():
         # Process the full prompt first
@@ -519,8 +630,8 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
             pass  # We'll still include this EOS token but won't generate further
         
         # Update KV cache if using it
-        if use_kv_cache:
-            past_key_values = outputs.past_key_values
+        if use_kv_cache and hasattr(outputs, 'past_key_values'):
+            kv_cache.update(outputs.past_key_values)
             
         # Generate remaining tokens auto-regressively
         for _ in range(max_tokens - 1):
@@ -532,17 +643,16 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
             new_input_ids = torch.tensor([[next_token]], device=device)
             
             # Extend attention mask for the new token
-            if use_kv_cache:
-                attention_mask = torch.cat([
-                    attention_mask, 
-                    torch.ones((1, 1), device=device, dtype=attention_mask.dtype)
-                ], dim=1)
+            attention_mask = torch.cat([
+                attention_mask, 
+                torch.ones((1, 1), device=device, dtype=attention_mask.dtype)
+            ], dim=1)
             
             # Forward pass
             outputs = model(
                 input_ids=new_input_ids,
-                attention_mask=attention_mask,  # Always provide attention mask
-                past_key_values=past_key_values if use_kv_cache else None,
+                attention_mask=attention_mask,
+                past_key_values=kv_cache.get() if use_kv_cache else None,
                 use_cache=use_kv_cache
             )
             
@@ -591,8 +701,8 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
                 break
             
             # Update KV cache
-            if use_kv_cache:
-                past_key_values = outputs.past_key_values
+            if use_kv_cache and hasattr(outputs, 'past_key_values'):
+                kv_cache.update(outputs.past_key_values)
     
     # Combine input and generated tokens
     all_ids = input_ids[0].tolist() + generated_ids
@@ -608,7 +718,7 @@ def generate_text(model, tokenizer, prompt, max_tokens=50, temperature=1.0, top_
 
 
 def generate_text_batch(model, tokenizer, prompts, max_tokens=50, temperature=1.0, top_p=0.9, top_k=0, repetition_penalty=1.0):
-    """Generate text for multiple prompts using continuous batching"""
+    """Generate text for multiple prompts using continuous batching with paged KV cache"""
     # Determine what device the model is on
     if hasattr(model, 'device'):
         device = model.device
@@ -616,8 +726,17 @@ def generate_text_batch(model, tokenizer, prompts, max_tokens=50, temperature=1.
         # If model is spread across devices, use the first parameter's device
         device = next(model.parameters()).device
     
-    # Create the continuous batcher
-    batcher = ContinuousBatcher(model, tokenizer, max_batch_size=len(prompts))
+    # Check if using Qwen model
+    is_qwen_model = "qwen" in tokenizer.name_or_path.lower() if hasattr(tokenizer, 'name_or_path') else False
+    
+    # Create the continuous batcher with paged KV cache
+    batcher = ContinuousBatcher(
+        model, 
+        tokenizer, 
+        max_batch_size=len(prompts),
+        page_size=32 if is_qwen_model else 16,  # Larger pages for Qwen
+        max_pages=128 if is_qwen_model else 64  # More pages for Qwen
+    )
     
     # Add all requests to the batcher
     start_time = time.time()
