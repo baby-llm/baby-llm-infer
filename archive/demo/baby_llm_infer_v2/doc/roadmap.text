@@ -1,0 +1,11 @@
+# Roadmap
+
+1. 了解基本的 LLM 推理过程
+2. 实现一个简单的单文件的 LLM 推理代码
+3. 代码分层，便于后续每个模块的迭代
+4. 持续优化 v2 版本代码的基本可用性
+    4.1 兼容 GPT-2和 Qwen 两种不同的方式，例如 Padding，Cache
+    4.2 解决 不能正常停止问题
+    4.3 简化代码
+5. 学习vLLM Sgalng代码
+6. 增加 v2 版本功能，包括 Continue Batch Paged Attention
